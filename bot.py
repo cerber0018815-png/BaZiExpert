@@ -1,10 +1,9 @@
 import asyncio
 import logging
 import os
-import json
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -14,9 +13,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    FSInputFile, LabeledPrice, PreCheckoutQuery
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiohttp
 import asyncpg
 from asyncpg import Pool, Record
@@ -24,13 +22,12 @@ from asyncpg import Pool, Record
 # ========== КОНФИГУРАЦИЯ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:port/db
+DATABASE_URL = os.getenv("DATABASE_URL")
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN")  # Получить у @BotFather
+BOT_USERNAME = os.getenv("BOT_USERNAME", "BaziExpert_Bot")
 
-YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
-YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
-
-if not all([BOT_TOKEN, DATABASE_URL, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY]):
-    raise ValueError("Не все переменные окружения заданы!")
+if not all([BOT_TOKEN, DATABASE_URL, PROVIDER_TOKEN]):
+    raise ValueError("Не все переменные окружения заданы! Нужны: BOT_TOKEN, DATABASE_URL, PROVIDER_TOKEN")
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -40,13 +37,11 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# Глобальный пул соединений с БД
 db_pool: Optional[Pool] = None
 
-# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ ==========
 
 async def init_db_pool():
-    """Создаёт пул соединений и создаёт таблицы, если их нет"""
     global db_pool
     db_pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
@@ -75,48 +70,75 @@ async def init_db_pool():
                 paid_at TIMESTAMP
             )
         ''')
-        # Таблица заказов (привязка платежей и файлов)
+        # Таблица заказов (история файлов)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(tg_id),
-                payment_id TEXT UNIQUE,
-                amount INTEGER DEFAULT 5000,
-                status TEXT DEFAULT 'pending',
                 file_path TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Таблица платежей (история)
+        # Таблица платежей – теперь для истории (опционально)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS payments (
                 id SERIAL PRIMARY KEY,
-                payment_id TEXT UNIQUE,
                 user_id BIGINT,
                 amount INTEGER,
-                status TEXT,
+                payload TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Индексы для ускорения
+        # Таблица настроек
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        # Цена по умолчанию в рублях
+        await conn.execute('''
+            INSERT INTO settings (key, value) VALUES ('price', '5000')
+            ON CONFLICT (key) DO NOTHING
+        ''')
+
+        # Индексы
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_status ON users(order_status)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)')
+
     logger.info("Таблицы созданы/проверены")
 
 async def close_db_pool():
-    """Закрывает пул соединений"""
     if db_pool:
         await db_pool.close()
         logger.info("Пул соединений закрыт")
 
-# Функции CRUD (все асинхронные)
+# ========== РАБОТА С НАСТРОЙКАМИ ==========
+async def get_setting(key: str, default: str = None) -> Optional[str]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchval('SELECT value FROM settings WHERE key = $1', key)
+        return row if row else default
 
+async def set_setting(key: str, value: str) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO settings (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = $2
+        ''', key, value)
+
+async def get_price() -> int:
+    """Возвращает цену в рублях (целое число)"""
+    price_str = await get_setting('price', '5000')
+    try:
+        return int(price_str)
+    except ValueError:
+        return 5000
+
+# ========== CRUD ПОЛЬЗОВАТЕЛЕЙ И ЗАКАЗОВ ==========
 async def get_user(tg_id: int) -> Optional[Record]:
     async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            'SELECT * FROM users WHERE tg_id = $1', tg_id
-        )
+        return await conn.fetchrow('SELECT * FROM users WHERE tg_id = $1', tg_id)
 
 async def create_user(tg_id: int, username: str, first_name: str, last_name: str) -> bool:
     async with db_pool.acquire() as conn:
@@ -146,37 +168,27 @@ async def get_all_orders(status: Optional[str] = None) -> List[Record]:
             return await conn.fetch('''
                 SELECT tg_id, username, first_name, birth_date, birth_time,
                        birth_city, gender, email, order_status, created_at
-                FROM users
-                WHERE order_status = $1
-                ORDER BY created_at DESC
+                FROM users WHERE order_status = $1 ORDER BY created_at DESC
             ''', status)
         else:
             return await conn.fetch('''
                 SELECT tg_id, username, first_name, birth_date, birth_time,
                        birth_city, gender, email, order_status, created_at
-                FROM users
-                ORDER BY created_at DESC
+                FROM users ORDER BY created_at DESC
             ''')
 
-async def save_payment(payment_id: str, user_id: int, amount: int, status: str) -> None:
+async def save_payment_history(user_id: int, amount: int, payload: str) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute('''
-            INSERT INTO payments (payment_id, user_id, amount, status)
-            VALUES ($1, $2, $3, $4)
-        ''', payment_id, user_id, amount, status)
-
-async def update_payment_status(payment_id: str, status: str) -> None:
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            UPDATE payments SET status = $1 WHERE payment_id = $2
-        ''', status, payment_id)
+            INSERT INTO payments (user_id, amount, payload)
+            VALUES ($1, $2, $3)
+        ''', user_id, amount, payload)
 
 async def save_order_file(tg_id: int, file_path: str) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute('''
-            INSERT INTO orders (user_id, file_path, status)
-            VALUES ($1, $2, 'done')
-            ON CONFLICT (user_id, payment_id) DO UPDATE SET file_path = $2
+            INSERT INTO orders (user_id, file_path)
+            VALUES ($1, $2)
         ''', tg_id, file_path)
 
 async def get_order_by_user(tg_id: int) -> Optional[Record]:
@@ -184,6 +196,10 @@ async def get_order_by_user(tg_id: int) -> Optional[Record]:
         return await conn.fetchrow(
             'SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1', tg_id
         )
+
+async def get_file_path_for_user(tg_id: int) -> Optional[str]:
+    order = await get_order_by_user(tg_id)
+    return order['file_path'] if order else None
 
 # ========== FSM СОСТОЯНИЯ ==========
 class OrderStates(StatesGroup):
@@ -193,8 +209,10 @@ class OrderStates(StatesGroup):
     waiting_gender = State()
     waiting_email = State()
     confirm_order = State()
-    waiting_payment = State()
-    waiting_file_upload = State()   # для админа
+    waiting_file_upload = State()          # для взятия в работу
+    waiting_upload_user_id = State()       # для ввода ID после загрузки файла
+    waiting_broadcast_text = State()       # для текста рассылки
+    waiting_new_price = State()            # для изменения цены
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -211,7 +229,8 @@ def get_admin_keyboard():
         keyboard=[
             [KeyboardButton(text="📋 Все заявки")],
             [KeyboardButton(text="⏳ Новые заявки"), KeyboardButton(text="✅ В работе")],
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")]
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="💰 Изменить цену"), KeyboardButton(text="🔍 Проверить платежи")]
         ],
         resize_keyboard=True
     )
@@ -224,59 +243,16 @@ def get_order_confirm_keyboard():
         ]
     )
 
-def get_payment_keyboard(payment_url: str):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить 5000 ₽", url=payment_url)],
-            [InlineKeyboardButton(text="✅ Я оплатил", callback_data="check_payment")],
-            [InlineKeyboardButton(text="❌ Отменить заказ", callback_data="cancel_order")]
-        ]
-    )
-
-# ========== ПЛАТЕЖИ ЮKASSA ==========
-async def create_payment(amount: int, description: str, user_id: int):
-    url = "https://api.yookassa.ru/v3/payments"
-    payment_id = str(uuid.uuid4())
-    payload = {
-        "amount": {"value": str(amount), "currency": "RUB"},
-        "payment_method_data": {"type": "bank_card"},
-        "confirmation": {
-            "type": "redirect",
-            "return_url": f"https://t.me/{bot.username}"  # подставьте свой username
-        },
-        "description": description,
-        "metadata": {"user_id": str(user_id), "payment_id": payment_id}
-    }
-    auth = aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, json=payload, auth=auth) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await save_payment(payment_id, user_id, amount, 'pending')
-                    return data
-                else:
-                    logger.error(f"Ошибка ЮKassa: {await resp.text()}")
-                    return None
-        except Exception as e:
-            logger.error(f"Исключение при создании платежа: {e}")
-            return None
-
-async def check_payment_status(payment_id: str):
-    url = f"https://api.yookassa.ru/v3/payments/{payment_id}"
-    auth = aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, auth=auth) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get('status')
-                return None
-        except Exception as e:
-            logger.error(f"Ошибка проверки платежа: {e}")
-            return None
-
 # ========== ХЕНДЛЕРЫ ==========
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("❌ Нет активного действия для отмены.")
+        return
+    await state.clear()
+    await message.answer("✅ Действие отменено.")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -291,10 +267,11 @@ async def cmd_start(message: types.Message):
         )
     if user_id in ADMIN_IDS:
         await message.answer(
-            "👋 Добро пожаловать в панель администратора!\n\nВыберите действие:",
+            "👋 Добро пожаловать в панель администратора!",
             reply_markup=get_admin_keyboard()
         )
         return
+    price = await get_price()
     text = (
         "🌟 Добро пожаловать в BaziExpertBot!\n\n"
         "Я помогу вам получить персональный разбор вашей карты Ба Цзы.\n\n"
@@ -303,23 +280,24 @@ async def cmd_start(message: types.Message):
         "• Определение Хозяина Дня\n"
         "• Прогноз на текущий год\n"
         "• Рекомендации по элементам\n\n"
-        "💰 Стоимость разбора: 5000 ₽\n\n"
+        f"💰 Стоимость разбора: {price} ₽\n\n"
         "Для заказа нажмите кнопку ниже 👇"
     )
     await message.answer(text, reply_markup=get_main_keyboard())
 
+# ========== ЗАКАЗ: СБОР ДАННЫХ ==========
 @dp.message(F.text == "📝 Заказать разбор")
 async def cmd_order(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     user = await get_user(user_id)
-    if user and user['order_status'] in ('paid', 'processing'):
+    if user and user['order_status'] in ('paid', 'processing', 'pending_payment'):
         await message.answer(
             "⚠️ У вас уже есть активный заказ. Мы работаем над ним!\n"
             "Если у вас есть вопросы, напишите администратору."
         )
         return
     await message.answer(
-        "📅 Пожалуйста, введите вашу дату рождения в формате:\nДД.ММ.ГГГГ\n\nНапример: 15.08.1990"
+        "📅 Введите дату рождения в формате ДД.ММ.ГГГГ\nНапример: 15.08.1990"
     )
     await state.set_state(OrderStates.waiting_birth_date)
 
@@ -333,9 +311,7 @@ async def process_birth_date(message: types.Message, state: FSMContext):
         return
     await state.update_data(birth_date=birth_date)
     await update_user_data(message.from_user.id, 'birth_date', birth_date)
-    await message.answer(
-        "🕐 Теперь укажите точное время рождения в формате ЧЧ:ММ\nНапример: 14:30\nЕсли неизвестно – 12:00"
-    )
+    await message.answer("🕐 Введите время рождения в формате ЧЧ:ММ (например, 14:30). Если неизвестно – 12:00")
     await state.set_state(OrderStates.waiting_birth_time)
 
 @dp.message(OrderStates.waiting_birth_time)
@@ -376,9 +352,7 @@ async def process_gender(message: types.Message, state: FSMContext):
         return
     await state.update_data(gender=gender)
     await update_user_data(message.from_user.id, 'gender', gender)
-    await message.answer(
-        "📧 Введите ваш email (необязательно) или напишите 'пропустить':"
-    )
+    await message.answer("📧 Введите email (необязательно) или напишите 'пропустить':")
     await state.set_state(OrderStates.waiting_email)
 
 @dp.message(OrderStates.waiting_email)
@@ -386,7 +360,7 @@ async def process_email(message: types.Message, state: FSMContext):
     email = message.text.strip()
     if email.lower() != 'пропустить':
         if '@' not in email or '.' not in email:
-            await message.answer("❌ Похоже, это не email. Введите корректный email или 'пропустить'")
+            await message.answer("❌ Введите корректный email или 'пропустить'")
             return
         await update_user_data(message.from_user.id, 'email', email)
     else:
@@ -394,34 +368,54 @@ async def process_email(message: types.Message, state: FSMContext):
         await update_user_data(message.from_user.id, 'email', None)
     await state.update_data(email=email)
     data = await state.get_data()
+    price = await get_price()
     confirm_text = (
-        "📋 Проверьте введенные данные:\n\n"
+        "📋 Проверьте данные:\n\n"
         f"📅 Дата рождения: {data['birth_date']}\n"
-        f"🕐 Время рождения: {data['birth_time']}\n"
+        f"🕐 Время: {data['birth_time']}\n"
         f"🏙️ Город: {data['birth_city']}\n"
         f"👤 Пол: {'Мужской' if data['gender'] == 'male' else 'Женский'}\n"
         f"📧 Email: {email or 'Не указан'}\n\n"
-        f"💰 Стоимость разбора: 5000 ₽\n\nВсе верно?"
+        f"💰 Стоимость разбора: {price} ₽\n\nВсе верно?"
     )
     await message.answer(confirm_text, reply_markup=get_order_confirm_keyboard())
     await state.set_state(OrderStates.confirm_order)
 
+# ========== ПЛАТЁЖНАЯ ЧАСТЬ ==========
 @dp.callback_query(F.data == "confirm_order")
 async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     data = await state.get_data()
-    await update_order_status(user_id, 'pending_payment')
-    payment_data = await create_payment(5000, f"Разбор Ба Цзы для {callback.from_user.first_name}", user_id)
-    if payment_data:
-        payment_url = payment_data['confirmation']['confirmation_url']
-        payment_id = payment_data['id']
-        await state.update_data(payment_id=payment_id)
-        await callback.message.edit_text(
-            "💳 Для оплаты перейдите по ссылке:\n\nПосле оплаты нажмите 'Я оплатил'.\n\n⚠️ Ссылка действительна 1 час.",
-            reply_markup=get_payment_keyboard(payment_url)
+    price = await get_price()  # цена в рублях
+
+    # Генерируем уникальный payload (для идентификации заказа)
+    payload = f"bazi_{user_id}_{int(datetime.now().timestamp())}"
+
+    try:
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="Разбор карты Ба Цзы",
+            description=(
+                f"Персональный разбор вашей карты Ба Цзы\n"
+                f"Дата рождения: {data['birth_date']}\n"
+                f"Время: {data['birth_time']}\n"
+                f"Город: {data['birth_city']}"
+            ),
+            payload=payload,
+            provider_token=PROVIDER_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label="Разбор Ба Цзы", amount=price * 100)],  # переводим в копейки!
+            start_parameter="bazi_order",
+            need_email=True,
+            need_phone_number=False,
         )
-    else:
-        await callback.message.edit_text("❌ Ошибка создания платежа. Попробуйте позже.")
+        # Сохраняем payload в состоянии на случай проверки
+        await state.update_data(payload=payload)
+        await update_order_status(user_id, 'pending_payment')
+        await callback.message.delete()
+    except Exception as e:
+        logger.error(f"Ошибка отправки инвойса: {e}")
+        await callback.message.edit_text("❌ Не удалось создать платёжный счёт. Попробуйте позже.")
     await callback.answer()
 
 @dp.callback_query(F.data == "edit_order")
@@ -430,47 +424,53 @@ async def edit_order(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(OrderStates.waiting_birth_date)
     await callback.answer()
 
-@dp.callback_query(F.data == "check_payment")
-async def check_payment(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    data = await state.get_data()
-    payment_id = data.get('payment_id')
-    if not payment_id:
-        await callback.answer("❌ Платеж не найден", show_alert=True)
-        return
-    status = await check_payment_status(payment_id)
-    if status == 'succeeded':
-        await update_order_status(user_id, 'paid')
-        await update_payment_status(payment_id, 'succeeded')
-        await update_user_data(user_id, 'paid_at', datetime.now())
-        user = await get_user(user_id)
-        await notify_admin_new_order(user)
-        await callback.message.edit_text(
-            "✅ Оплата получена! Ваша заявка принята в работу. Разбор будет готов в течение 24-48 часов."
-        )
-        await state.clear()
-    elif status == 'pending':
-        await callback.answer("⏳ Платеж еще не прошел. Подождите или проверьте позже.", show_alert=True)
-    else:
-        await callback.answer("❌ Платеж не найден или отклонен. Попробуйте снова.", show_alert=True)
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    # Здесь можно добавить дополнительную валидацию (например, проверить payload)
+    await bot.answer_pre_checkout_query(
+        pre_checkout_query.id,
+        ok=True,
+        error_message="Извините, произошла ошибка. Попробуйте позже."
+    )
 
-@dp.callback_query(F.data == "cancel_order")
-async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("❌ Заказ отменен. Если передумаете, начните заново /start")
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    payment = message.successful_payment
+
+    # Сохраняем историю платежа (опционально)
+    await save_payment_history(user_id, payment.total_amount, payment.payload)
+
+    # Обновляем статус заказа
+    await update_order_status(user_id, 'paid')
+    await update_user_data(user_id, 'paid_at', datetime.now())
+
+    # Уведомляем администратора
+    user = await get_user(user_id)
+    await notify_admin_new_order(user)
+
+    # Очищаем состояние
     await state.clear()
-    await callback.answer()
 
+    await message.answer(
+        "✅ Оплата успешно получена!\n\n"
+        "Ваша заявка принята в работу. Разбор будет готов в течение 24-48 часов.\n"
+        "Как только разбор будет готов, вы получите уведомление."
+    )
+
+# ========== ИНФОРМАЦИОННЫЕ КНОПКИ ==========
 @dp.message(F.text == "ℹ️ О сервисе")
 async def about(message: types.Message):
+    price = await get_price()
     text = (
-        "🔮 **О сервисе BaziExpert**\n\n"
+        f"🔮 **О сервисе BaziExpert**\n\n"
         "Профессиональный разбор карты Ба Цзы.\n\n"
         "**Входит:**\n"
         "• Анализ 4-х столпов\n"
         "• Хозяин Дня и элементы\n"
         "• Прогноз на текущий год\n"
         "• Рекомендации\n\n"
-        "💰 5000 ₽\nСрок: 24-48 часов."
+        f"💰 Стоимость: {price} ₽\nСрок: 24-48 часов."
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -482,7 +482,6 @@ async def contacts(message: types.Message):
     )
 
 # ========== АДМИН-ФУНКЦИИ ==========
-
 async def notify_admin_new_order(user: Record):
     text = (
         "🆕 **НОВЫЙ ЗАКАЗ!**\n\n"
@@ -508,18 +507,61 @@ async def admin_all_orders(message: types.Message):
     if not orders:
         await message.answer("📭 Заявок нет.")
         return
+
     text = "📋 **Все заявки (последние 20):**\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+
     for order in orders[:20]:
         status_emoji = {
             'new': '🆕', 'pending_payment': '⏳', 'paid': '✅',
             'processing': '🔄', 'done': '📄'
         }.get(order['order_status'], '❓')
+        created_date = order['created_at'].strftime('%Y-%m-%d') if order['created_at'] else '—'
+
+        if order['order_status'] == 'done':
+            file_path = await get_file_path_for_user(order['tg_id'])
+            file_info = f"📁 Файл: {file_path or 'не найден'}"
+            btn = InlineKeyboardButton(
+                text="📤 Отправить повторно",
+                callback_data=f"resend_{order['tg_id']}"
+            )
+            keyboard.inline_keyboard.append([btn])
+        else:
+            file_info = ""
+
         text += (
             f"{status_emoji} ID: {order['tg_id']} | {order['first_name'] or 'Без имени'}\n"
             f"   Дата: {order['birth_date']} | Статус: {order['order_status']}\n"
-            f"   Заказано: {order['created_at'][:10]}\n\n"
+            f"   Заказано: {created_date}\n"
+            f"   {file_info}\n\n"
         )
-    await message.answer(text, parse_mode="Markdown")
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("resend_"))
+async def resend_file_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Нет прав", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[1])
+    file_path = await get_file_path_for_user(user_id)
+    if not file_path:
+        await callback.answer("❌ Файл не найден в БД", show_alert=True)
+        return
+    if not os.path.exists(file_path):
+        await callback.answer("❌ Файл отсутствует на сервере", show_alert=True)
+        return
+    try:
+        await bot.send_document(
+            user_id,
+            FSInputFile(file_path),
+            caption="📄 Повторная отправка вашего разбора Ба Цзы."
+        )
+        await callback.answer("✅ Файл отправлен повторно!", show_alert=True)
+        await callback.message.answer(f"✅ Файл повторно отправлен пользователю {user_id}.")
+    except Exception as e:
+        logger.error(f"Ошибка повторной отправки: {e}")
+        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
 
 @dp.message(F.text == "⏳ Новые заявки")
 async def admin_new_orders(message: types.Message):
@@ -531,11 +573,12 @@ async def admin_new_orders(message: types.Message):
         return
     text = "🆕 **Новые оплаченные заявки:**\n\n"
     for order in orders:
+        created_date = order['created_at'].strftime('%Y-%m-%d') if order['created_at'] else '—'
         text += (
             f"👤 {order['first_name']} (ID: {order['tg_id']})\n"
             f"📅 {order['birth_date']} в {order['birth_time']}, {order['birth_city']}\n"
             f"📧 {order['email'] or 'не указан'}\n"
-            f"📅 Заказано: {order['created_at'][:10]}\n\n"
+            f"📅 Заказано: {created_date}\n\n"
         )
     await message.answer(text, parse_mode="Markdown")
 
@@ -543,12 +586,10 @@ async def admin_new_orders(message: types.Message):
 async def admin_work(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    await message.answer(
-        "✏️ Введите ID пользователя (Telegram ID), чей заказ вы берете в работу:\nНапример: 123456789"
-    )
+    await message.answer("✏️ Введите ID пользователя (Telegram ID):")
     await state.set_state(OrderStates.waiting_file_upload)
 
-@dp.message(OrderStates.waiting_file_upload)
+@dp.message(StateFilter(OrderStates.waiting_file_upload))
 async def process_work_assignment(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -591,10 +632,10 @@ async def admin_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     await message.answer("📢 Введите текст для рассылки (или /cancel для отмены):")
-    await state.set_state(OrderStates.waiting_email)  # переиспользуем
+    await state.set_state(OrderStates.waiting_broadcast_text)
 
-@dp.message(StateFilter(OrderStates.waiting_email))
-async def process_broadcast(message: types.Message, state: FSMContext):
+@dp.message(StateFilter(OrderStates.waiting_broadcast_text))
+async def process_broadcast_text(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     if message.text == "/cancel":
@@ -615,7 +656,53 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена. Отправлено: {sent} сообщений.")
     await state.clear()
 
-# ========== ЗАГРУЗКА ФАЙЛОВ (админ) ==========
+# ========== ИЗМЕНЕНИЕ ЦЕНЫ ==========
+@dp.message(F.text == "💰 Изменить цену")
+async def admin_change_price(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    current_price = await get_price()
+    await message.answer(
+        f"💰 **Текущая цена:** {current_price} ₽\n\n"
+        "Введите новую цену в **рублях** (только число):\n"
+        "Например: 7000\n\n"
+        "Для отмены отправьте /cancel",
+        parse_mode="Markdown"
+    )
+    await state.set_state(OrderStates.waiting_new_price)
+
+@dp.message(StateFilter(OrderStates.waiting_new_price))
+async def process_new_price(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        new_price = int(message.text.strip())
+        if new_price <= 0:
+            await message.answer("❌ Цена должна быть больше 0.")
+            return
+    except ValueError:
+        await message.answer("❌ Введите число (например, 7000)")
+        return
+    # Сохраняем в рублях
+    await set_setting('price', str(new_price))
+    await message.answer(f"✅ Цена успешно изменена на {new_price} ₽")
+    await state.clear()
+
+# ========== ПРОВЕРКА ПЛАТЕЖНОЙ СИСТЕМЫ (упрощённо) ==========
+@dp.message(F.text == "🔍 Проверить платежи")
+async def admin_check_payment_system(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not PROVIDER_TOKEN:
+        await message.answer("❌ PROVIDER_TOKEN не задан в переменных окружения.")
+        return
+    # Проверить, что токен не пустой
+    await message.answer(
+        "ℹ️ Платёжный провайдер подключён. Токен присутствует.\n"
+        "Для полноценной проверки создайте тестовый заказ."
+    )
+
+# ========== ЗАГРУЗКА ФАЙЛОВ ==========
 @dp.message(F.document)
 async def handle_file_upload(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
@@ -628,53 +715,102 @@ async def handle_file_upload(message: types.Message, state: FSMContext):
     if doc.file_size > 50 * 1024 * 1024:
         await message.answer("❌ Файл слишком большой (макс 50 МБ)")
         return
+
+    temp_name = f"temp_{uuid.uuid4().hex}_{doc.file_name}"
+    temp_path = f"media/{temp_name}"
     os.makedirs('media', exist_ok=True)
-    file_path = f"media/{doc.file_name}"
+
     file = await bot.get_file(doc.file_id)
-    await bot.download_file(file.file_path, file_path)
+    await bot.download_file(file.file_path, temp_path)
 
-    # Спросим, для какого пользователя этот файл
-    await message.answer(
-        "✏️ Введите ID пользователя (Telegram ID), которому отправить этот файл:"
-    )
-    # Сохраним путь в состояние
-    await state.update_data(upload_file_path=file_path)
+    await state.update_data(temp_file_path=temp_path, original_name=doc.file_name)
+    await message.answer("✏️ Введите ID пользователя (Telegram ID), которому отправить этот файл:")
+    await state.set_state(OrderStates.waiting_upload_user_id)
 
-@dp.message(StateFilter(OrderStates.waiting_file_upload))  # переиспользуем то же состояние для ввода ID после загрузки
+@dp.message(StateFilter(OrderStates.waiting_upload_user_id))
 async def process_upload_user_id(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
+
     try:
         user_id = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Введите число (ID)")
         return
-    data = await state.get_data()
-    file_path = data.get('upload_file_path')
-    if not file_path:
-        await message.answer("❌ Файл не найден, загрузите заново.")
-        await state.clear()
-        return
+
     user = await get_user(user_id)
     if not user:
         await message.answer("❌ Пользователь не найден.")
         return
-    # Отправим файл клиенту
+
+    data = await state.get_data()
+    temp_path = data.get('temp_file_path')
+    original_name = data.get('original_name')
+
+    if not temp_path or not os.path.exists(temp_path):
+        await message.answer("❌ Временный файл не найден. Загрузите файл заново.")
+        await state.clear()
+        return
+
+    base, ext = os.path.splitext(original_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_filename = f"bazi_{user_id}_{timestamp}_{base}{ext}"
+    final_path = f"media/{new_filename}"
+
     try:
-        with open(file_path, 'rb') as f:
-            await bot.send_document(
-                user_id,
-                types.FSInputFile(file_path),
-                caption="📄 Ваш разбор Ба Цзы готов! Благодарим за доверие."
-            )
-        # Обновим статус заказа
+        os.rename(temp_path, final_path)
+        logger.info(f"Файл переименован: {final_path}")
+
+        await bot.send_document(
+            user_id,
+            FSInputFile(final_path),
+            caption="📄 Ваш разбор Ба Цзы готов! Благодарим за доверие."
+        )
+
         await update_order_status(user_id, 'done')
-        await save_order_file(user_id, file_path)
-        await message.answer(f"✅ Файл отправлен пользователю {user_id}.")
+        await save_order_file(user_id, final_path)
+
+        await message.answer(
+            f"✅ Файл отправлен пользователю {user_id}.\n📁 Путь: {final_path}"
+        )
+        await state.clear()
     except Exception as e:
-        logger.error(f"Ошибка отправки файла: {e}")
+        logger.error(f"Ошибка обработки файла: {e}")
         await message.answer(f"❌ Ошибка: {e}")
-    await state.clear()
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        await state.clear()
+
+# ========== КОМАНДА /getfile ==========
+@dp.message(Command("getfile"))
+async def cmd_getfile(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет прав.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /getfile <ID_пользователя>")
+        return
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+        return
+    file_path = await get_file_path_for_user(user_id)
+    if not file_path:
+        await message.answer(f"❌ Для пользователя {user_id} не найден файл.")
+        return
+    if not os.path.exists(file_path):
+        await message.answer(f"❌ Файл отсутствует на сервере: {file_path}")
+        return
+    try:
+        await bot.send_document(
+            message.chat.id,
+            FSInputFile(file_path),
+            caption=f"📁 Файл для пользователя {user_id}:\n{file_path}"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки файла: {e}")
 
 # ========== ЗАПУСК ==========
 async def main():
