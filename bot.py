@@ -15,7 +15,6 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile, LabeledPrice, PreCheckoutQuery
 )
-import aiohttp
 import asyncpg
 from asyncpg import Pool, Record
 
@@ -23,7 +22,7 @@ from asyncpg import Pool, Record
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 DATABASE_URL = os.getenv("DATABASE_URL")
-PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN")  # Получить у @BotFather
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "BaziExpert_Bot")
 
 if not all([BOT_TOKEN, DATABASE_URL, PROVIDER_TOKEN]):
@@ -79,7 +78,7 @@ async def init_db_pool():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Таблица платежей – теперь для истории (опционально)
+        # Таблица платежей – для истории
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS payments (
                 id SERIAL PRIMARY KEY,
@@ -89,6 +88,9 @@ async def init_db_pool():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # ДОБАВЛЯЕМ КОЛОНКУ payload, если её нет (на случай старой структуры)
+        await conn.execute('ALTER TABLE payments ADD COLUMN IF NOT EXISTS payload TEXT')
+
         # Таблица настроек
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS settings (
@@ -96,7 +98,6 @@ async def init_db_pool():
                 value TEXT
             )
         ''')
-        # Цена по умолчанию в рублях
         await conn.execute('''
             INSERT INTO settings (key, value) VALUES ('price', '5000')
             ON CONFLICT (key) DO NOTHING
@@ -128,11 +129,13 @@ async def set_setting(key: str, value: str) -> None:
         ''', key, value)
 
 async def get_price() -> int:
-    """Возвращает цену в рублях (целое число)"""
     price_str = await get_setting('price', '5000')
     try:
-        return int(price_str)
-    except ValueError:
+        price = int(price_str.strip())
+        if price <= 0:
+            return 5000
+        return price
+    except (ValueError, AttributeError):
         return 5000
 
 # ========== CRUD ПОЛЬЗОВАТЕЛЕЙ И ЗАКАЗОВ ==========
@@ -209,10 +212,10 @@ class OrderStates(StatesGroup):
     waiting_gender = State()
     waiting_email = State()
     confirm_order = State()
-    waiting_file_upload = State()          # для взятия в работу
-    waiting_upload_user_id = State()       # для ввода ID после загрузки файла
-    waiting_broadcast_text = State()       # для текста рассылки
-    waiting_new_price = State()            # для изменения цены
+    waiting_file_upload = State()
+    waiting_upload_user_id = State()
+    waiting_broadcast_text = State()
+    waiting_new_price = State()
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -386,9 +389,13 @@ async def process_email(message: types.Message, state: FSMContext):
 async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     data = await state.get_data()
-    price = await get_price()  # цена в рублях
+    price = await get_price()
+    
+    if price <= 0:
+        await callback.message.edit_text("❌ Ошибка: цена не установлена. Обратитесь к администратору.")
+        await callback.answer()
+        return
 
-    # Генерируем уникальный payload (для идентификации заказа)
     payload = f"bazi_{user_id}_{int(datetime.now().timestamp())}"
 
     try:
@@ -404,18 +411,17 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
             payload=payload,
             provider_token=PROVIDER_TOKEN,
             currency="RUB",
-            prices=[LabeledPrice(label="Разбор Ба Цзы", amount=price * 100)],  # переводим в копейки!
+            prices=[LabeledPrice(label="Разбор Ба Цзы", amount=int(price * 100))],
             start_parameter="bazi_order",
             need_email=True,
             need_phone_number=False,
         )
-        # Сохраняем payload в состоянии на случай проверки
         await state.update_data(payload=payload)
         await update_order_status(user_id, 'pending_payment')
         await callback.message.delete()
     except Exception as e:
         logger.error(f"Ошибка отправки инвойса: {e}")
-        await callback.message.edit_text("❌ Не удалось создать платёжный счёт. Попробуйте позже.")
+        await callback.message.edit_text(f"❌ Не удалось создать платёжный счёт. Ошибка: {e}")
     await callback.answer()
 
 @dp.callback_query(F.data == "edit_order")
@@ -426,7 +432,6 @@ async def edit_order(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
-    # Здесь можно добавить дополнительную валидацию (например, проверить payload)
     await bot.answer_pre_checkout_query(
         pre_checkout_query.id,
         ok=True,
@@ -438,18 +443,15 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     payment = message.successful_payment
 
-    # Сохраняем историю платежа (опционально)
-    await save_payment_history(user_id, payment.total_amount, payment.payload)
+    # Исправлено: используем invoice_payload
+    await save_payment_history(user_id, payment.total_amount, payment.invoice_payload)
 
-    # Обновляем статус заказа
     await update_order_status(user_id, 'paid')
     await update_user_data(user_id, 'paid_at', datetime.now())
 
-    # Уведомляем администратора
     user = await get_user(user_id)
     await notify_admin_new_order(user)
 
-    # Очищаем состояние
     await state.clear()
 
     await message.answer(
@@ -683,12 +685,11 @@ async def process_new_price(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите число (например, 7000)")
         return
-    # Сохраняем в рублях
     await set_setting('price', str(new_price))
     await message.answer(f"✅ Цена успешно изменена на {new_price} ₽")
     await state.clear()
 
-# ========== ПРОВЕРКА ПЛАТЕЖНОЙ СИСТЕМЫ (упрощённо) ==========
+# ========== ПРОВЕРКА ПЛАТЕЖНОЙ СИСТЕМЫ ==========
 @dp.message(F.text == "🔍 Проверить платежи")
 async def admin_check_payment_system(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -696,7 +697,6 @@ async def admin_check_payment_system(message: types.Message):
     if not PROVIDER_TOKEN:
         await message.answer("❌ PROVIDER_TOKEN не задан в переменных окружения.")
         return
-    # Проверить, что токен не пустой
     await message.answer(
         "ℹ️ Платёжный провайдер подключён. Токен присутствует.\n"
         "Для полноценной проверки создайте тестовый заказ."
